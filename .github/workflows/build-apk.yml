@@ -16,8 +16,11 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Extract source
-        run: unzip -o GastoPay.zip
+      - name: Rebuild source archive
+        run: |
+          base64 -d GastoPay.zip.b64 > GastoPay.zip
+          unzip -t GastoPay.zip
+          unzip -o GastoPay.zip
 
       - name: Set up JDK 17
         uses: actions/setup-java@v4
