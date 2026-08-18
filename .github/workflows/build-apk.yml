@@ -18,7 +18,8 @@ jobs:
 
       - name: Rebuild source archive
         run: |
-          base64 -d GastoPay.zip.b64 > GastoPay.zip
+          cat source_chunks/gpchunk_* > GastoPay.zip.b64.rebuilt
+          base64 -d GastoPay.zip.b64.rebuilt > GastoPay.zip
           unzip -t GastoPay.zip
           unzip -o GastoPay.zip
 
