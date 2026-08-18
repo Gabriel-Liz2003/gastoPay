@@ -23,17 +23,26 @@ jobs:
           unzip -t GastoPay.zip
           unzip -o GastoPay.zip
 
-      - name: Apply Calendar provider compile fix
+      - name: Apply Android compile fixes
         run: |
           python - <<'PY'
           from pathlib import Path
-          p = Path('GastoPay/app/src/main/java/com/gabriel/gastopay/CalendarBridge.java')
-          s = p.read_text()
+
+          calendar = Path('GastoPay/app/src/main/java/com/gabriel/gastopay/CalendarBridge.java')
+          s = calendar.read_text()
           old = 'values.put(CalendarContract.Events.CALENDAR_ID, calendarId);'
           new = 'values.put(CalendarContract.Events.CALENDAR_ID, String.valueOf(calendarId));'
           if old not in s and new not in s:
               raise SystemExit('Expected CalendarBridge line not found')
-          p.write_text(s.replace(old, new))
+          calendar.write_text(s.replace(old, new))
+
+          main = Path('GastoPay/app/src/main/java/com/gabriel/gastopay/MainActivity.java')
+          s = main.read_text()
+          old = 'boolean listener = NotificationManager.getEnabledListenerPackages(this).contains(getPackageName());'
+          new = 'String enabledListeners = Settings.Secure.getString(getContentResolver(), "enabled_notification_listeners");\n        boolean listener = enabledListeners != null && enabledListeners.contains(getPackageName());'
+          if old not in s and new not in s:
+              raise SystemExit('Expected notification listener line not found')
+          main.write_text(s.replace(old, new))
           PY
 
       - name: Set up JDK 17
