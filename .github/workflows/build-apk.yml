@@ -85,7 +85,6 @@ jobs:
 
               public static Target findWritableGoogleCalendarTarget(Context context) {
                   if (!hasPermission(context)) return null;
-
                   String[] projection = {
                           CalendarContract.Calendars._ID,
                           CalendarContract.Calendars.ACCOUNT_NAME,
@@ -96,7 +95,6 @@ jobs:
                           CalendarContract.Calendars.IS_PRIMARY,
                           CalendarContract.Calendars.SYNC_EVENTS
                   };
-
                   try (Cursor c = context.getContentResolver().query(
                           CalendarContract.Calendars.CONTENT_URI,
                           projection,
@@ -108,20 +106,12 @@ jobs:
                       if (c == null) return null;
                       Target fallback = null;
                       while (c.moveToNext()) {
-                          long id = c.getLong(0);
-                          String accountName = c.getString(1);
-                          String accountType = c.getString(2);
-                          String displayName = c.getString(3);
-                          int primary = c.getInt(6);
-                          int syncEvents = c.getInt(7);
-                          Target t = new Target(id, accountName, accountType, displayName);
+                          Target t = new Target(c.getLong(0), c.getString(1), c.getString(2), c.getString(3));
                           if (fallback == null) fallback = t;
-                          if (primary == 1 && syncEvents == 1) return t;
+                          if (c.getInt(6) == 1 && c.getInt(7) == 1) return t;
                       }
                       return fallback;
-                  } catch (Exception e) {
-                      return null;
-                  }
+                  } catch (Exception e) { return null; }
               }
 
               public static Long findWritableGoogleCalendar(Context context) {
@@ -140,13 +130,11 @@ jobs:
               public static boolean enqueue(Context context, TransactionRecord record, BudgetStore store) {
                   Target target = findWritableGoogleCalendarTarget(context);
                   if (target == null) return false;
-
                   long start = record.timestamp;
                   long end = start + 60_000L;
                   String action = record.type == TransactionType.PURCHASE ? "COMPRA" : "ESTORNO";
                   String title = "[GastoPay] " + action + " " + MoneyUtils.formatBrl(record.amountCents) + " — " + record.merchant;
                   LocalDate nextPayment = LocalDate.ofEpochDay(store.getNextPaymentEpochDay());
-
                   String description = "GASTOPAY_PENDING=1\n" +
                           "version=2\n" +
                           "transaction_id=" + sanitize(record.id) + "\n" +
@@ -160,7 +148,6 @@ jobs:
                           "spent_brl=" + MoneyUtils.decimalBrl(record.spentAfterCents) + "\n" +
                           "next_payment=" + nextPayment + "\n" +
                           "source=" + sanitize(record.source) + "\n";
-
                   ContentValues values = new ContentValues();
                   values.put(CalendarContract.Events.CALENDAR_ID, target.id);
                   values.put(CalendarContract.Events.DTSTART, start);
@@ -171,14 +158,11 @@ jobs:
                   values.put(CalendarContract.Events.AVAILABILITY, CalendarContract.Events.AVAILABILITY_FREE);
                   values.put(CalendarContract.Events.ACCESS_LEVEL, CalendarContract.Events.ACCESS_PRIVATE);
                   values.put(CalendarContract.Events.HAS_ALARM, 0);
-
                   try {
                       ContentResolver cr = context.getContentResolver();
                       Uri inserted = cr.insert(CalendarContract.Events.CONTENT_URI, values);
                       if (inserted == null) return false;
-
-                      if (target.accountName != null && !target.accountName.isEmpty()
-                              && target.accountType != null && !target.accountType.isEmpty()) {
+                      if (target.accountName != null && !target.accountName.isEmpty() && target.accountType != null && !target.accountType.isEmpty()) {
                           try {
                               Account account = new Account(target.accountName, target.accountType);
                               Bundle extras = new Bundle();
@@ -188,9 +172,7 @@ jobs:
                           } catch (Exception ignored) {}
                       }
                       return true;
-                  } catch (Exception e) {
-                      return false;
-                  }
+                  } catch (Exception e) { return false; }
               }
 
               private static String sanitize(String s) {
@@ -210,6 +192,12 @@ jobs:
               s = s.replace(old, new)
           p.write_text(s)
           PY
+
+      - name: Upload patched source
+        uses: actions/upload-artifact@v4
+        with:
+          name: GastoPay-patched-source
+          path: GastoPay
 
       - name: Set up JDK 17
         uses: actions/setup-java@v4
