@@ -23,6 +23,19 @@ jobs:
           unzip -t GastoPay.zip
           unzip -o GastoPay.zip
 
+      - name: Apply Calendar provider compile fix
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          p = Path('GastoPay/app/src/main/java/com/gabriel/gastopay/CalendarBridge.java')
+          s = p.read_text()
+          old = 'values.put(CalendarContract.Events.CALENDAR_ID, calendarId);'
+          new = 'values.put(CalendarContract.Events.CALENDAR_ID, String.valueOf(calendarId));'
+          if old not in s and new not in s:
+              raise SystemExit('Expected CalendarBridge line not found')
+          p.write_text(s.replace(old, new))
+          PY
+
       - name: Set up JDK 17
         uses: actions/setup-java@v4
         with:
