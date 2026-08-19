@@ -1,0 +1,105 @@
+name: Build GastoPay v4 Recovery
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ "agent/**" ]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Rebuild source archive
+        run: |
+          cat source_chunks/gpchunk_* > GastoPay.zip.b64.rebuilt
+          base64 -d GastoPay.zip.b64.rebuilt > GastoPay.zip
+          unzip -t GastoPay.zip
+          unzip -o GastoPay.zip
+
+      - name: Reuse current v4 transformation
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          p = Path('.github/workflows/build-apk.yml')
+          lines = p.read_text().splitlines()
+          start = None
+          for i, line in enumerate(lines):
+              if '- name: Apply Android fixes, account picker and listener recovery' in line:
+                  start = i
+                  break
+          if start is None:
+              raise SystemExit('transform step not found')
+          run_idx = None
+          for i in range(start + 1, len(lines)):
+              if lines[i].strip() == 'run: |':
+                  run_idx = i + 1
+                  break
+          if run_idx is None:
+              raise SystemExit('run block not found')
+          body = []
+          for i in range(run_idx, len(lines)):
+              line = lines[i]
+              if line.startswith('      - name:'):
+                  break
+              body.append(line[10:] if line.startswith('          ') else line)
+          Path('/tmp/apply-v4.sh').write_text('\n'.join(body) + '\n')
+          PY
+          bash /tmp/apply-v4.sh
+
+      - name: Fix duplicate lifecycle method
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          p = Path('GastoPay/app/src/main/java/com/gabriel/gastopay/MainActivity.java')
+          s = p.read_text()
+          recovery = '''    @Override\n    protected void onResume() {\n        super.onResume();\n        GastoNotificationListener.requestReconnect(this);\n        refresh();\n    }\n\n'''
+          # Remove the recovery method appended by the transformation.
+          if s.count('protected void onResume()') > 1 and recovery in s:
+              s = s.replace(recovery, '', 1)
+          # Upgrade the original onResume instead.
+          old = '''    @Override\n    protected void onResume() {\n        super.onResume();\n        if (store != null) refresh();\n    }'''
+          new = '''    @Override\n    protected void onResume() {\n        super.onResume();\n        GastoNotificationListener.requestReconnect(this);\n        if (store != null) refresh();\n    }'''
+          if old in s:
+              s = s.replace(old, new, 1)
+          if s.count('protected void onResume()') != 1:
+              raise SystemExit('Expected exactly one onResume after fix')
+          p.write_text(s)
+          PY
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install Android SDK 35
+        run: sdkmanager "platforms;android-35" "build-tools;35.0.0"
+
+      - name: Set up Gradle 8.9
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.9'
+
+      - name: Unit tests
+        working-directory: GastoPay
+        run: gradle :app:testDebugUnitTest --stacktrace
+
+      - name: Build debug APK
+        working-directory: GastoPay
+        run: gradle :app:assembleDebug --stacktrace
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: GastoPay-v4-recovery-apk
+          path: GastoPay/app/build/outputs/apk/debug/app-debug.apk
+          if-no-files-found: error
