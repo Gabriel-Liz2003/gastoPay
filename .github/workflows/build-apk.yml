@@ -1,0 +1,345 @@
+name: Build Android APK
+
+on:
+  push:
+    branches: [ "main", "agent/**", "feature/**" ]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Rebuild source archive
+        run: |
+          cat source_chunks/gpchunk_* > GastoPay.zip.b64.rebuilt
+          base64 -d GastoPay.zip.b64.rebuilt > GastoPay.zip
+          unzip -t GastoPay.zip
+          unzip -o GastoPay.zip
+
+      - name: Apply Android fixes, account picker and listener recovery
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+
+          manifest = Path('GastoPay/app/src/main/AndroidManifest.xml')
+          m = manifest.read_text()
+          if 'android.permission.WRITE_SYNC_SETTINGS' not in m:
+              m = m.replace(
+                  '    <uses-permission android:name="android.permission.WRITE_CALENDAR" />\n',
+                  '    <uses-permission android:name="android.permission.WRITE_CALENDAR" />\n'
+                  '    <uses-permission android:name="android.permission.WRITE_SYNC_SETTINGS" />\n'
+              )
+          manifest.write_text(m)
+
+          main = Path('GastoPay/app/src/main/java/com/gabriel/gastopay/MainActivity.java')
+          s = main.read_text()
+
+          s = s.replace(
+              'boolean listener = NotificationManager.getEnabledListenerPackages(this).contains(getPackageName());',
+              'String enabledListeners = Settings.Secure.getString(getContentResolver(), "enabled_notification_listeners");\n'
+              '        boolean listener = enabledListeners != null && enabledListeners.contains(getPackageName());'
+          )
+
+          if 'Button calendarAccount = button("3. Escolher conta do Google Agenda"' not in s:
+              s = s.replace(
+                  '        Button calendar = button("2. Liberar acesso ao Google Agenda", v -> requestCalendarPermissions());\n'
+                  '        root.addView(calendar);\n',
+                  '        Button calendar = button("2. Liberar acesso ao Google Agenda", v -> requestCalendarPermissions());\n'
+                  '        root.addView(calendar);\n\n'
+                  '        Button calendarAccount = button("3. Escolher conta do Google Agenda", v -> showCalendarAccountPicker());\n'
+                  '        root.addView(calendarAccount);\n'
+              )
+
+          old_status = '"\\n• Google Agenda: " + (calendarPerm ? (calId != null ? "PRONTO" : "sem agenda gravável") : "PENDENTE") +'
+          new_status = '"\\n• Google Agenda: " + (calendarPerm ? (calId != null ? "PRONTO — " + CalendarBridge.getSelectedCalendarLabel(this) : (CalendarBridge.getWritableGoogleCalendars(this).size() > 1 ? "ESCOLHA UMA CONTA" : "sem agenda Google gravável")) : "PENDENTE") +'
+          s = s.replace(old_status, new_status)
+
+          if 'Serviço de captura:' not in s:
+              needle = '"• Leitura de notificações: " + (listener ? "ATIVA" : "PENDENTE") +'
+              repl = '"• Leitura de notificações: " + (listener ? "ATIVA" : "PENDENTE") +\n                "\\n• Serviço de captura: " + (GastoNotificationListener.isConnected() ? "CONECTADO" : (listener ? "RECONECTANDO" : "INATIVO")) +'
+              s = s.replace(needle, repl)
+
+          marker = '    private void requestCalendarPermissions() {\n'
+          picker = '''    private void showCalendarAccountPicker() {\n        if (!CalendarBridge.hasPermission(this)) {\n            toast("Libere o acesso ao Google Agenda primeiro.");\n            requestCalendarPermissions();\n            return;\n        }\n        List<CalendarBridge.Target> targets = CalendarBridge.getWritableGoogleCalendars(this);\n        if (targets.isEmpty()) {\n            toast("Não encontrei nenhuma conta Google com Agenda gravável.");\n            return;\n        }\n        String[] labels = new String[targets.size()];\n        int checked = -1;\n        String selected = CalendarBridge.getSelectedGoogleAccount(this);\n        for (int i = 0; i < targets.size(); i++) {\n            CalendarBridge.Target t = targets.get(i);\n            labels[i] = t.accountName + ((t.displayName != null && !t.displayName.equalsIgnoreCase(t.accountName)) ? " — " + t.displayName : "");\n            if (t.accountName.equals(selected)) checked = i;\n        }\n        AlertDialog dialog = new AlertDialog.Builder(this)\n                .setTitle("Qual conta o GastoPay deve usar?")\n                .setSingleChoiceItems(labels, checked, null)\n                .setNegativeButton("Cancelar", null)\n                .setPositiveButton("Usar esta conta", null)\n                .create();\n        dialog.setOnShowListener(d -> dialog.getButton(AlertDialog.BUTTON_POSITIVE).setOnClickListener(v -> {\n            int pos = dialog.getListView().getCheckedItemPosition();\n            if (pos < 0 || pos >= targets.size()) {\n                toast("Selecione uma conta.");\n                return;\n            }\n            CalendarBridge.setSelectedGoogleAccount(this, targets.get(pos).accountName);\n            dialog.dismiss();\n            refresh();\n            toast("Conta selecionada: " + targets.get(pos).accountName);\n        }));\n        dialog.show();\n    }\n\n'''
+          if picker not in s:
+              s = s.replace(marker, picker + marker)
+
+          # Ask Android to rebind the notification listener whenever the app becomes visible.
+          resume = '''    @Override\n    protected void onResume() {\n        super.onResume();\n        GastoNotificationListener.requestReconnect(this);\n        refresh();\n    }\n\n'''
+          if 'GastoNotificationListener.requestReconnect(this);' not in s:
+              idx = s.rfind('\n}')
+              s = s[:idx] + '\n' + resume + s[idx:]
+
+          main.write_text(s)
+          PY
+
+          cat > GastoPay/app/src/main/java/com/gabriel/gastopay/GastoNotificationListener.java <<'JAVA'
+          package com.gabriel.gastopay;
+
+          import android.app.Notification;
+          import android.content.ComponentName;
+          import android.content.Context;
+          import android.os.Bundle;
+          import android.service.notification.NotificationListenerService;
+          import android.service.notification.StatusBarNotification;
+
+          public class GastoNotificationListener extends NotificationListenerService {
+              private final TransactionParser parser = new TransactionParser();
+              private static volatile GastoNotificationListener instance;
+
+              public static boolean isConnected() {
+                  return instance != null;
+              }
+
+              public static void requestReconnect(Context context) {
+                  try {
+                      NotificationListenerService.requestRebind(
+                              new ComponentName(context, GastoNotificationListener.class));
+                  } catch (Exception ignored) {}
+              }
+
+              @Override
+              public void onListenerConnected() {
+                  super.onListenerConnected();
+                  instance = this;
+                  recoverActiveNotifications();
+              }
+
+              @Override
+              public void onListenerDisconnected() {
+                  instance = null;
+                  super.onListenerDisconnected();
+              }
+
+              @Override
+              public void onDestroy() {
+                  if (instance == this) instance = null;
+                  super.onDestroy();
+              }
+
+              @Override
+              public void onNotificationPosted(StatusBarNotification sbn) {
+                  process(sbn);
+              }
+
+              private void recoverActiveNotifications() {
+                  try {
+                      StatusBarNotification[] active = getActiveNotifications();
+                      if (active == null) return;
+                      for (StatusBarNotification sbn : active) {
+                          process(sbn);
+                      }
+                  } catch (Exception ignored) {}
+              }
+
+              private void process(StatusBarNotification sbn) {
+                  if (sbn == null) return;
+                  String pkg = sbn.getPackageName();
+                  BudgetStore store = new BudgetStore(this);
+
+                  if (TransactionParser.WALLET_PACKAGE.equals(pkg) && !store.isWalletEnabled()) return;
+                  if (TransactionParser.NUBANK_PACKAGE.equals(pkg) && !store.isNubankEnabled()) return;
+                  if (!TransactionParser.WALLET_PACKAGE.equals(pkg) && !TransactionParser.NUBANK_PACKAGE.equals(pkg)) return;
+
+                  Notification n = sbn.getNotification();
+                  if (n == null || n.extras == null) return;
+                  Bundle e = n.extras;
+                  String title = stringOf(e.getCharSequence(Notification.EXTRA_TITLE));
+                  String text = joinNotificationText(e);
+
+                  TransactionParser.Result parsed = parser.parse(pkg, title, text);
+                  if (parsed == null) return;
+
+                  String source = TransactionParser.WALLET_PACKAGE.equals(pkg) ? "Google Wallet" : "Nubank";
+                  String id = store.makeTransactionId(pkg + "|" + sbn.getKey() + "|" + sbn.getPostTime());
+                  TransactionRecord record = store.apply(id, sbn.getPostTime(), parsed.amountCents,
+                          parsed.merchant, source, parsed.type, true);
+                  if (record == null) return;
+
+                  AppNotifier.show(this, record);
+
+                  if (store.isBridgeEnabled() && CalendarBridge.hasPermission(this)) {
+                      new Thread(() -> CalendarBridge.enqueue(getApplicationContext(), record, store), "gastopay-calendar").start();
+                  }
+              }
+
+              private String joinNotificationText(Bundle e) {
+                  StringBuilder out = new StringBuilder();
+                  append(out, e.getCharSequence(Notification.EXTRA_TEXT));
+                  append(out, e.getCharSequence(Notification.EXTRA_BIG_TEXT));
+                  append(out, e.getCharSequence(Notification.EXTRA_SUB_TEXT));
+                  CharSequence[] lines = e.getCharSequenceArray(Notification.EXTRA_TEXT_LINES);
+                  if (lines != null) {
+                      for (CharSequence line : lines) append(out, line);
+                  }
+                  return out.toString();
+              }
+
+              private void append(StringBuilder sb, CharSequence value) {
+                  if (value == null) return;
+                  String s = value.toString().trim();
+                  if (s.isEmpty()) return;
+                  if (sb.indexOf(s) >= 0) return;
+                  if (sb.length() > 0) sb.append('\n');
+                  sb.append(s);
+              }
+
+              private String stringOf(CharSequence c) {
+                  return c == null ? "" : c.toString();
+              }
+          }
+          JAVA
+
+          cat > GastoPay/app/src/main/java/com/gabriel/gastopay/CalendarBridge.java <<'JAVA'
+          package com.gabriel.gastopay;
+
+          import android.Manifest;
+          import android.accounts.Account;
+          import android.content.ContentResolver;
+          import android.content.ContentValues;
+          import android.content.Context;
+          import android.content.SharedPreferences;
+          import android.content.pm.PackageManager;
+          import android.database.Cursor;
+          import android.net.Uri;
+          import android.os.Bundle;
+          import android.provider.CalendarContract;
+
+          import java.time.LocalDate;
+          import java.util.ArrayList;
+          import java.util.LinkedHashMap;
+          import java.util.List;
+          import java.util.Map;
+          import java.util.TimeZone;
+
+          public final class CalendarBridge {
+              private static final String PREFS = "gastopay_calendar_bridge";
+              private static final String KEY_ACCOUNT = "selected_google_account";
+              private CalendarBridge() {}
+
+              public static final class Target {
+                  public final long id;
+                  public final String accountName;
+                  public final String accountType;
+                  public final String displayName;
+                  Target(long id, String accountName, String accountType, String displayName) {
+                      this.id = id; this.accountName = accountName; this.accountType = accountType; this.displayName = displayName;
+                  }
+              }
+
+              public static boolean hasPermission(Context context) {
+                  return context.checkSelfPermission(Manifest.permission.READ_CALENDAR) == PackageManager.PERMISSION_GRANTED
+                          && context.checkSelfPermission(Manifest.permission.WRITE_CALENDAR) == PackageManager.PERMISSION_GRANTED;
+              }
+
+              public static List<Target> getWritableGoogleCalendars(Context context) {
+                  List<Target> result = new ArrayList<>();
+                  if (!hasPermission(context)) return result;
+                  String[] projection = { CalendarContract.Calendars._ID, CalendarContract.Calendars.ACCOUNT_NAME,
+                          CalendarContract.Calendars.ACCOUNT_TYPE, CalendarContract.Calendars.CALENDAR_DISPLAY_NAME,
+                          CalendarContract.Calendars.CALENDAR_ACCESS_LEVEL, CalendarContract.Calendars.VISIBLE,
+                          CalendarContract.Calendars.IS_PRIMARY, CalendarContract.Calendars.SYNC_EVENTS };
+                  Map<String, Target> byAccount = new LinkedHashMap<>();
+                  try (Cursor c = context.getContentResolver().query(CalendarContract.Calendars.CONTENT_URI, projection,
+                          CalendarContract.Calendars.ACCOUNT_TYPE + "=? AND " + CalendarContract.Calendars.VISIBLE + "=1 AND " +
+                                  CalendarContract.Calendars.CALENDAR_ACCESS_LEVEL + ">=?",
+                          new String[]{"com.google", String.valueOf(CalendarContract.Calendars.CAL_ACCESS_CONTRIBUTOR)},
+                          CalendarContract.Calendars.IS_PRIMARY + " DESC, " + CalendarContract.Calendars.SYNC_EVENTS + " DESC")) {
+                      if (c == null) return result;
+                      while (c.moveToNext()) {
+                          String accountName = c.getString(1);
+                          if (accountName == null || accountName.trim().isEmpty()) continue;
+                          if (!byAccount.containsKey(accountName)) byAccount.put(accountName,
+                                  new Target(c.getLong(0), accountName, c.getString(2), c.getString(3)));
+                      }
+                  } catch (Exception ignored) { return result; }
+                  result.addAll(byAccount.values()); return result;
+              }
+
+              public static String getSelectedGoogleAccount(Context context) {
+                  return context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).getString(KEY_ACCOUNT, null);
+              }
+              public static void setSelectedGoogleAccount(Context context, String accountName) {
+                  SharedPreferences.Editor e = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit();
+                  if (accountName == null || accountName.trim().isEmpty()) e.remove(KEY_ACCOUNT); else e.putString(KEY_ACCOUNT, accountName); e.apply();
+              }
+              public static Target findWritableGoogleCalendarTarget(Context context) {
+                  List<Target> targets = getWritableGoogleCalendars(context); if (targets.isEmpty()) return null;
+                  String selected = getSelectedGoogleAccount(context);
+                  if (selected != null) for (Target t : targets) if (selected.equals(t.accountName)) return t;
+                  if (targets.size() == 1) { setSelectedGoogleAccount(context, targets.get(0).accountName); return targets.get(0); }
+                  return null;
+              }
+              public static Long findWritableGoogleCalendar(Context context) { Target t = findWritableGoogleCalendarTarget(context); return t == null ? null : t.id; }
+              public static String getSelectedCalendarLabel(Context context) {
+                  Target t = findWritableGoogleCalendarTarget(context); if (t == null) return null;
+                  String name = t.displayName == null || t.displayName.trim().isEmpty() ? "Google Agenda" : t.displayName.trim();
+                  return t.accountName + (name.equalsIgnoreCase(t.accountName) ? "" : " • " + name);
+              }
+              public static boolean enqueue(Context context, TransactionRecord record, BudgetStore store) {
+                  Target target = findWritableGoogleCalendarTarget(context); if (target == null) return false;
+                  long start = record.timestamp, end = start + 60_000L;
+                  String action = record.type == TransactionType.PURCHASE ? "COMPRA" : "ESTORNO";
+                  String title = "[GastoPay] " + action + " " + MoneyUtils.formatBrl(record.amountCents) + " — " + record.merchant;
+                  LocalDate nextPayment = LocalDate.ofEpochDay(store.getNextPaymentEpochDay());
+                  String description = "GASTOPAY_PENDING=1\nversion=4\ntransaction_id=" + sanitize(record.id) + "\ntype=" + record.type.name() +
+                          "\namount_cents=" + record.amountCents + "\namount_brl=" + MoneyUtils.decimalBrl(record.amountCents) +
+                          "\nmerchant=" + sanitize(record.merchant) + "\nremaining_cents=" + record.remainingAfterCents +
+                          "\nremaining_brl=" + MoneyUtils.decimalBrl(record.remainingAfterCents) + "\nspent_cents=" + record.spentAfterCents +
+                          "\nspent_brl=" + MoneyUtils.decimalBrl(record.spentAfterCents) + "\nnext_payment=" + nextPayment +
+                          "\nsource=" + sanitize(record.source) + "\n";
+                  ContentValues values = new ContentValues(); values.put(CalendarContract.Events.CALENDAR_ID, target.id);
+                  values.put(CalendarContract.Events.DTSTART, start); values.put(CalendarContract.Events.DTEND, end);
+                  values.put(CalendarContract.Events.EVENT_TIMEZONE, TimeZone.getDefault().getID()); values.put(CalendarContract.Events.TITLE, title);
+                  values.put(CalendarContract.Events.DESCRIPTION, description); values.put(CalendarContract.Events.AVAILABILITY, CalendarContract.Events.AVAILABILITY_FREE);
+                  values.put(CalendarContract.Events.ACCESS_LEVEL, CalendarContract.Events.ACCESS_PRIVATE); values.put(CalendarContract.Events.HAS_ALARM, 0);
+                  try {
+                      ContentResolver cr = context.getContentResolver(); Uri inserted = cr.insert(CalendarContract.Events.CONTENT_URI, values); if (inserted == null) return false;
+                      try { Account account = new Account(target.accountName, target.accountType); Bundle extras = new Bundle();
+                          extras.putBoolean(ContentResolver.SYNC_EXTRAS_MANUAL, true); extras.putBoolean(ContentResolver.SYNC_EXTRAS_EXPEDITED, true);
+                          ContentResolver.requestSync(account, CalendarContract.AUTHORITY, extras); } catch (Exception ignored) {}
+                      return true;
+                  } catch (Exception e) { return false; }
+              }
+              private static String sanitize(String s) { if (s == null) return ""; return s.replace("\n", " ").replace("\r", " ").trim(); }
+          }
+          JAVA
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install Android SDK 35
+        run: sdkmanager "platforms;android-35" "build-tools;35.0.0"
+
+      - name: Set up Gradle 8.9
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.9'
+
+      - name: Unit tests
+        working-directory: GastoPay
+        run: gradle :app:testDebugUnitTest --stacktrace
+
+      - name: Build debug APK
+        working-directory: GastoPay
+        run: gradle :app:assembleDebug --stacktrace
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: GastoPay-v4-apk
+          path: GastoPay/app/build/outputs/apk/debug/app-debug.apk
+          if-no-files-found: error
