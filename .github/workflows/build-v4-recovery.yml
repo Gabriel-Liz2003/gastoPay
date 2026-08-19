@@ -4,6 +4,7 @@ on:
   workflow_dispatch:
   push:
     branches: [ "agent/**" ]
+  pull_request:
 
 jobs:
   build:
@@ -59,10 +60,8 @@ jobs:
           p = Path('GastoPay/app/src/main/java/com/gabriel/gastopay/MainActivity.java')
           s = p.read_text()
           recovery = '''    @Override\n    protected void onResume() {\n        super.onResume();\n        GastoNotificationListener.requestReconnect(this);\n        refresh();\n    }\n\n'''
-          # Remove the recovery method appended by the transformation.
           if s.count('protected void onResume()') > 1 and recovery in s:
               s = s.replace(recovery, '', 1)
-          # Upgrade the original onResume instead.
           old = '''    @Override\n    protected void onResume() {\n        super.onResume();\n        if (store != null) refresh();\n    }'''
           new = '''    @Override\n    protected void onResume() {\n        super.onResume();\n        GastoNotificationListener.requestReconnect(this);\n        if (store != null) refresh();\n    }'''
           if old in s:
